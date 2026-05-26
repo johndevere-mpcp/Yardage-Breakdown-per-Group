@@ -24,6 +24,7 @@ from typing import Dict, List
 import streamlit as st
 
 from swim_parser import (
+    DAY_ORDER,
     WEEK_HEADER_RE,
     compute_workout_totals,
     _yard_total,
@@ -88,6 +89,33 @@ def render_bucket_row(totals: Dict[str, int]) -> None:
             delta_color="off",
             help=GROUP_HINTS[key],
         )
+
+
+def daily_to_markdown(daily_subtotals: Dict, week_num: int) -> str:
+    """Render the per-day rollup for one week as a markdown table.
+
+    Per the boss's spec: mini-microcycle = day, so this table sums all
+    sub-sessions (AM + PM, multiple coaches) that fall on the same
+    weekday into a single row. Sorted Mon → Sun via DAY_ORDER.
+    """
+    lines = [
+        "| Day | Sprint | Mid | Distance | All | Total yd | Total m |",
+        "|:---|---:|---:|---:|---:|---:|---:|",
+    ]
+    keys = [(wn, d) for (wn, d) in daily_subtotals if wn == week_num]
+    keys.sort(key=lambda k: DAY_ORDER.get(k[1], 999))
+    for k in keys:
+        dt = daily_subtotals[k]
+        dy = _yard_total(dt)
+        dm = _meter_total(dt)
+        if dy == 0 and dm == 0:
+            continue
+        lines.append(
+            f"| {k[1].capitalize()} | {dt['sprint_y']:,} | {dt['mid_y']:,} "
+            f"| {dt['distance_y']:,} | {dt['all_y']:,} "
+            f"| **{dy:,}** | {dm:,} |"
+        )
+    return "\n".join(lines) if len(lines) > 2 else "_No daily data for this week._"
 
 
 def workouts_to_markdown(workouts: List[dict], header_max: int = 60) -> str:
@@ -338,7 +366,9 @@ for week_num in sorted(results["weekly_subtotals"]):
     expanded = (week_filter is not None) or (len(results["weekly_subtotals"]) == 1)
     with st.expander(expander_label, expanded=expanded):
         render_bucket_row(wt)
-        st.markdown("**Workouts:**")
+        st.markdown("**Per-day breakdown (mini-microcycle):**")
+        st.markdown(daily_to_markdown(results["daily_subtotals"], week_num))
+        st.markdown("**Individual workouts:**")
         week_workouts = [w for w in results["workouts"] if w["week"] == week_num]
         st.markdown(workouts_to_markdown(week_workouts))
 

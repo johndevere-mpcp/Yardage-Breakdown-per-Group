@@ -184,6 +184,50 @@ GROUP_HEADER_RE = re.compile(
 # SPRINT: section headers), the sub-session inherits that group.
 ATHLETES_LINE_RE = re.compile(r"^\s*Athletes?\s*[:\-]\s*(.+?)\s*$", re.IGNORECASE)
 
+# Day-of-week extractor for per-day rollups. Matches both full
+# ('Wednesday, August 27, 2025') and abbreviated ('MON AM 15') headers
+# at the start of a sub-session label. Returns the canonical full-name
+# lowercase form ('monday'..'sunday') for grouping multiple sub-sessions
+# on the same training day (e.g. 'Wednesday AM Coach: Noah' + 'Wednesday
+# PM Coach: Dave' both → 'wednesday').
+DAY_NAME_RE = re.compile(
+    r"^(?:\w+,\s+)?(?P<day>"
+    r"mon(?:day)?|tu(?:e|es|esday)?|wed(?:nesday)?|"
+    r"thu(?:r|rs|rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?"
+    r")\b",
+    re.IGNORECASE,
+)
+# Sort order so the per-day rollup displays Mon → Sun.
+DAY_ORDER = {
+    "monday": 1, "tuesday": 2, "wednesday": 3, "thursday": 4,
+    "friday": 5, "saturday": 6, "sunday": 7, "unknown": 8,
+}
+_DAY_CANONICAL = {
+    "mon": "monday", "monday": "monday",
+    "tu": "tuesday", "tue": "tuesday", "tues": "tuesday", "tuesday": "tuesday",
+    "wed": "wednesday", "wednesday": "wednesday",
+    "thu": "thursday", "thur": "thursday", "thurs": "thursday", "thursday": "thursday",
+    "fri": "friday", "friday": "friday",
+    "sat": "saturday", "saturday": "saturday",
+    "sun": "sunday", "sunday": "sunday",
+}
+
+
+def extract_day_name(header: str) -> str:
+    """Return canonical day-of-week ('monday'..'sunday') for a sub-session.
+
+    Returns 'unknown' when the header doesn't begin with a recognized day
+    name (rare — usually only for select-coach placeholder rows that have
+    no real header). Used to roll multiple sub-sessions on the same
+    training day (AM + PM, different coaches) into a single day-level
+    bucket for the per-day breakdown.
+    """
+    h = header.lstrip()
+    m = DAY_NAME_RE.match(h)
+    if not m:
+        return "unknown"
+    return _DAY_CANONICAL.get(m.group("day").lower(), "unknown")
+
 # An empty per-category total dict (used as a clean accumulator). Buckets
 # track sprint/mid/distance/all for yards AND meters separately so a
 # workout written in meters (e.g. an LCM session with [2,100m / 3,800m]
@@ -831,6 +875,7 @@ def compute_workout_totals(text: str,
     rosters = build_athlete_rosters(text)
 
     weekly_by_num: Dict[int, Dict[str, int]] = {}
+    daily_by_key: Dict[Tuple[int, str], Dict[str, int]] = {}
     grand = empty_totals()
     workout_records: List[Dict] = []
     deduped: List[Dict] = []
@@ -874,8 +919,10 @@ def compute_workout_totals(text: str,
                     continue
                 seen_body_hashes.add(h)
 
+        day_name = extract_day_name(header)
         workout_records.append({
             "week": week_num,
+            "day": day_name,
             "header": header,
             "method": method,
             "default_group": default_group,
@@ -884,11 +931,15 @@ def compute_workout_totals(text: str,
         accumulate(grand, manual)
         weekly_by_num.setdefault(week_num, empty_totals())
         accumulate(weekly_by_num[week_num], manual)
+        day_key = (week_num, day_name)
+        daily_by_key.setdefault(day_key, empty_totals())
+        accumulate(daily_by_key[day_key], manual)
         parsed += 1
 
     return {
         "workouts": workout_records,
         "weekly_subtotals": weekly_by_num,
+        "daily_subtotals": daily_by_key,
         "grand_total": grand,
         "workouts_parsed": parsed,
         "deduped": deduped,
