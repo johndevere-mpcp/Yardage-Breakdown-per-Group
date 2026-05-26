@@ -202,6 +202,118 @@ def workouts_to_csv(workouts: List[dict]) -> str:
     return buf.getvalue()
 
 
+def build_xlsx(results: Dict) -> bytes:
+    """Render the full results as a 4-sheet Excel workbook.
+
+    Mirrors the website's hierarchy:
+      Sheet 1 'Summary'    - Grand total + per-group percentages
+      Sheet 2 'Per Week'   - One row per week (all 18 in the season)
+      Sheet 3 'Per Day'    - One row per (week, day) — the mini-microcycle view
+      Sheet 4 'Workouts'   - One row per sub-session (most granular)
+
+    Each downstream sheet drills into the level above. Header row is
+    bold; total/section rows are bold. Column widths auto-fit on content.
+    """
+    from io import BytesIO
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+
+    wb = Workbook()
+    bold = Font(bold=True)
+    header_fill = PatternFill("solid", fgColor="DDDDDD")
+
+    def write_header(ws, headers):
+        ws.append(headers)
+        for cell in ws[ws.max_row]:
+            cell.font = bold
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="center")
+
+    def autosize(ws):
+        for col in ws.columns:
+            max_len = max((len(str(c.value)) if c.value is not None else 0
+                          for c in col), default=0)
+            ws.column_dimensions[col[0].column_letter].width = min(max_len + 2, 50)
+
+    # ---- Sheet 1: Summary ----
+    ws = wb.active
+    ws.title = "Summary"
+    gt = results["grand_total"]
+    y_total = _yard_total(gt)
+    m_total = _meter_total(gt)
+
+    write_header(ws, ["Group", "Yards", "Meters", "% of Total"])
+    for key, label in [("sprint", "Sprint (Dave)"),
+                       ("mid", "Mid (Josh)"),
+                       ("distance", "Distance (Noah)"),
+                       ("all", "All (whole-team)")]:
+        y = gt[f"{key}_y"]
+        m = gt[f"{key}_m"]
+        pct = (y / y_total * 100) if y_total else 0
+        ws.append([label, y, m, f"{pct:.1f}%"])
+    ws.append(["TOTAL", y_total, m_total, "100.0%"])
+    for cell in ws[ws.max_row]:
+        cell.font = bold
+    ws.append([])
+    ws.append([f"Sub-sessions parsed: {results['workouts_parsed']}"])
+    if results.get("deduped"):
+        ws.append([
+            f"Duplicates auto-removed: {len(results['deduped'])} "
+            f"({sum(d['yards'] for d in results['deduped']):,} yd)"
+        ])
+    autosize(ws)
+
+    # ---- Sheet 2: Per Week ----
+    ws = wb.create_sheet("Per Week")
+    write_header(ws, ["Week", "Sprint", "Mid", "Distance", "All",
+                      "Total yd", "Total m"])
+    for wn in sorted(results["weekly_subtotals"]):
+        wt = results["weekly_subtotals"][wn]
+        ws.append([
+            f"Week {wn}",
+            wt["sprint_y"], wt["mid_y"], wt["distance_y"], wt["all_y"],
+            _yard_total(wt), _meter_total(wt),
+        ])
+    autosize(ws)
+
+    # ---- Sheet 3: Per Day ----
+    ws = wb.create_sheet("Per Day")
+    write_header(ws, ["Week", "Day", "Sprint", "Mid", "Distance", "All",
+                      "Total yd", "Total m"])
+    keys = sorted(
+        results["daily_subtotals"].keys(),
+        key=lambda k: (k[0], DAY_ORDER.get(k[1], 999)),
+    )
+    for (wn, day) in keys:
+        dt = results["daily_subtotals"][(wn, day)]
+        ws.append([
+            wn, day.capitalize(),
+            dt["sprint_y"], dt["mid_y"], dt["distance_y"], dt["all_y"],
+            _yard_total(dt), _meter_total(dt),
+        ])
+    autosize(ws)
+
+    # ---- Sheet 4: Workouts ----
+    ws = wb.create_sheet("Workouts")
+    write_header(ws, ["Week", "Day", "Workout", "Default Group", "Method",
+                      "Sprint", "Mid", "Distance", "All",
+                      "Total yd", "Total m"])
+    for w in results["workouts"]:
+        t = w["totals"]
+        ws.append([
+            w["week"], w.get("day", "").capitalize(), w["header"],
+            w["default_group"], w["method"],
+            t["sprint_y"], t["mid_y"], t["distance_y"], t["all_y"],
+            _yard_total(t), _meter_total(t),
+        ])
+    autosize(ws)
+
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
+
+
 # ---------------------------------------------------------------------------
 # Page layout.
 # ---------------------------------------------------------------------------
@@ -378,12 +490,29 @@ st.divider()
 st.subheader("All Workouts")
 st.markdown(workouts_to_markdown(results["workouts"]))
 
-# CSV export.
+# Export — both flat CSV (one row per workout) and structured Excel
+# (4 sheets matching the website hierarchy: Summary / Per Week / Per
+# Day / Workouts). The Excel mirrors how the page is laid out so the
+# boss can drill from the headline down to a single sub-session.
 st.subheader("Export")
-st.download_button(
-    label="Download CSV",
-    data=workouts_to_csv(results["workouts"]),
-    file_name="swim_workouts.csv",
-    mime="text/csv",
-    help="One row per workout. Includes per-group yards and meters.",
-)
+col_xlsx, col_csv = st.columns(2)
+with col_xlsx:
+    st.download_button(
+        label="Download Excel (4 sheets, week-by-week)",
+        data=build_xlsx(results),
+        file_name="swim_workouts.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        help=(
+            "Multi-sheet workbook: Summary, Per Week, Per Day, and "
+            "Workouts. Matches the page layout — Summary at top, then "
+            "drill down by week / day / individual workout."
+        ),
+    )
+with col_csv:
+    st.download_button(
+        label="Download CSV (flat workouts table)",
+        data=workouts_to_csv(results["workouts"]),
+        file_name="swim_workouts.csv",
+        mime="text/csv",
+        help="One row per workout. Useful for pivot-tabling in Excel/Sheets.",
+    )
