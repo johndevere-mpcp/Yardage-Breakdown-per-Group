@@ -153,29 +153,41 @@ COACH_GROUP_MAP = {
     "noah": "distance",
 }
 
-# A line that names a training group as a SECTION HEADER. Recognized forms:
-#   'SPRINT: Abby (3rd effort breaststroke), Arielle, ...'  (inline, with
-#       athlete/lane list trailing — typical for whole-team workouts where
-#       one Main Set is split into three lane blocks)
+# A line that starts with a training-group keyword. Used by parse_block
+# to switch the current group attribution for the sets that follow.
+# Now permissive: ANY line whose first word is sprint / mid / distance /
+# mid-distance counts as a group header — no colon required. Catches all
+# of these:
+#   'SPRINT: Abby (3rd effort breaststroke), Arielle, ...'
 #   'DISTANCE: Kathryn, Camille, ...'
-#   'MID-DISTANCE: Bert, Lilou, ...'   (hyphen or space between mid+distance)
-#   'Sprint:'  'Mid Set:'  'DISTANCE'   (bare forms)
-# Anchors at line start and accepts EITHER (a) keyword + colon/hyphen,
-# (b) keyword + 'Set'/'Group'/'Work'/'Swimmers' word, or (c) keyword alone
-# at end of line. A set line like 'Sprint 50s' won't false-positive because
-# none of those terminator branches follow the bare keyword.
-# Two important regex details:
-#   1. `mid(?![\s\-]+distance)` prevents the engine from backtracking to plain
-#      `mid` when the `mid[\s\-]*distance` form fails its terminator check.
-#      Without the lookahead, a line like 'Mid-distance + Distance Stay
-#      Together' falls back to matching just 'Mid' with the '-' acting as
-#      the [:\-] terminator, turning the rest of the line into bogus names.
-#   2. The 'Set/Group/Work/Swimmers' branch consumes an optional trailing
-#      colon (`\s*[:\-]?`), so 'Distance Group: Kathryn, ...' lands m.end()
-#      after the colon and the first parsed name is 'kathryn' (not ': kathryn').
+#   'MID-DISTANCE: Bert, Lilou, ...'
+#   'Distance Freestyle'                  (section label, no colon)
+#   'Mid Stroke - As written'             (section label, no colon)
+#   'Sprint Freestyle & Backstroke'
+#   'Sprint - choice equipment on the 2nd round'
+#   'MID'     'Sprint'     'DISTANCE'     (bare keyword)
+# The `^\s*` anchor prevents mid-line matches like '3x100 sprint'.
+# The `mid(?![\s\-]+distance)` lookahead stops the engine from
+# backtracking to bare `mid` on a 'Mid-distance' line (which should hit
+# the full mid-distance alternation).
+#
+# NOTE: this regex is NOT used for roster building — see
+# ROSTER_HEADER_RE below, which is stricter (requires an explicit
+# colon) so 'freestyle' from 'Distance Freestyle' never becomes a
+# false-positive athlete name.
 GROUP_HEADER_RE = re.compile(
     r"(?i)^\s*(sprint|mid[\s\-]*distance|distance|mid(?![\s\-]+distance))\b"
-    r"(?:\s*[:\-]|\s+(?:set|sets|group|work|swimmers?)\s*[:\-]?|\s*$)"
+)
+
+# Strict variant used ONLY by extract_athletes_from_group_header to
+# build the season-wide athlete roster. Requires the keyword to be
+# followed (optionally via a Set/Group/Work/Swimmers suffix) by a colon
+# or hyphen — i.e. an explicit "this introduces a list" marker. Lines
+# like 'Distance Freestyle' / 'Mid Stroke' won't qualify for roster
+# extraction.
+ROSTER_HEADER_RE = re.compile(
+    r"(?i)^\s*(sprint|mid[\s\-]*distance|distance|mid(?![\s\-]+distance))\b"
+    r"(?:\s+(?:set|sets|group|work|swimmers?))?\s*[:\-]"
 )
 
 # An 'Athletes: name, name, ...' header line. Used by coach_group_from_body
@@ -421,11 +433,14 @@ def is_likely_name(piece: str) -> bool:
 def extract_athletes_from_group_header(line: str):
     """Return (group, [athlete_names]) for a group section header line.
 
-    Returns (None, []) if the line isn't a group section header.
-    Names are lowercased; group is one of sprint/mid/distance
-    (mid-distance is already normalized to 'mid' by detect_group_header).
+    Uses ROSTER_HEADER_RE (the strict variant that requires an explicit
+    colon/hyphen after the keyword) so that section labels like
+    'Distance Freestyle' or 'Mid Stroke - As written' don't get parsed
+    as if 'Freestyle' / 'Stroke' were athletes. Returns (None, []) if
+    the line isn't an explicit roster header. Group is one of
+    sprint/mid/distance (mid-distance normalizes to 'mid').
     """
-    m = GROUP_HEADER_RE.match(line)
+    m = ROSTER_HEADER_RE.match(line)
     if not m:
         return None, []
     group = detect_group_header(line)
