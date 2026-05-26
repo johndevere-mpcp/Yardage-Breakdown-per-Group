@@ -52,9 +52,18 @@ WEEK_HEADER_RE = re.compile(r"^\s*week\s+(\d+)\s*$", re.IGNORECASE)
 # instead of full dates ("Monday AM", "Tuesday PM 1", etc.); we treat each
 # as a workout boundary so those weeks aren't reported as empty. Anchored
 # at line start so an inline mention can't false-positive.
+#
+# Starting around Week 11 the doc also uses ABBREVIATED day names — 'MON
+# AM 15', 'TU AM 11', 'WED PM 12', 'THU AM 13'. Without matching these,
+# late-season workouts would inherit the previous matched header (often
+# a 'Saturday PM' overview line at the top of the week), which both
+# duplicates the prior week's content and loses Weeks 16/17 entirely
+# because their MON/WED/etc headers never match.
 DAY_TIME_RE = re.compile(
-    r"(?i)^\s*(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)"
-    r"\s+(?:AM|PM)\b"
+    r"(?i)^\s*(?:"
+    r"mon(?:day)?|tu(?:e|es|esday)?|wed(?:nesday)?|"
+    r"thu(?:r|rs|rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?"
+    r")\s+(?:AM|PM)\b"
 )
 
 # A Coach: / Coach - line ALSO splits the file: each parallel sub-workout in
@@ -871,7 +880,11 @@ def main() -> int:
     if not args.input.is_file():
         print(f"File not found: {args.input}", file=sys.stderr)
         return 1
-    text = args.input.read_text(encoding="utf-8")
+    # utf-8-sig (not plain utf-8) transparently strips a leading BOM if the
+    # file was saved by an editor that adds one (Google Docs export does on
+    # some systems). Without this, a BOM would prefix the first line and a
+    # 'Week 11' header at the top of the file fails to match WEEK_HEADER_RE.
+    text = args.input.read_text(encoding="utf-8-sig")
     results = compute_workout_totals(text, week_filter=args.week)
     if not results["workouts"]:
         print("No workouts found.", file=sys.stderr)

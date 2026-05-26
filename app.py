@@ -146,7 +146,11 @@ def combine_uploaded_files(uploaded_files) -> tuple:
     """
     decoded = []
     for uf in uploaded_files:
-        text = uf.read().decode("utf-8")
+        # utf-8-sig strips a leading BOM if present. Without this, a BOM at
+        # the start of the file prefixes ﻿ onto the first line and the
+        # WEEK_HEADER_RE on that line silently fails to match, causing all
+        # the file's content to be tagged as the previous file's last week.
+        text = uf.read().decode("utf-8-sig")
         decoded.append((uf.name, text, min_week_in_text(text)))
     decoded.sort(key=lambda t: (t[2], t[0]))
     combined = "\n\n".join(text for _, text, _ in decoded)
