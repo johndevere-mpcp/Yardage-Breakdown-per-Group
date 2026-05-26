@@ -24,6 +24,7 @@ from typing import Dict, List
 import streamlit as st
 
 from swim_parser import (
+    WEEK_HEADER_RE,
     compute_workout_totals,
     _yard_total,
     _meter_total,
@@ -118,6 +119,41 @@ def workouts_to_markdown(workouts: List[dict], header_max: int = 60) -> str:
     return "\n".join(lines)
 
 
+def min_week_in_text(text: str) -> int:
+    """Return the smallest 'Week N' header found in text (high sentinel if none).
+
+    Used to sort multi-file uploads chronologically — a file containing
+    'Week 1..10' sorts before one containing 'Week 11..17', regardless of
+    the order the user dropped them in the uploader. Files without any
+    Week header fall to the end of the order.
+    """
+    weeks = []
+    for line in text.splitlines():
+        m = WEEK_HEADER_RE.match(line)
+        if m:
+            weeks.append(int(m.group(1)))
+    return min(weeks) if weeks else 10_000
+
+
+def combine_uploaded_files(uploaded_files) -> tuple:
+    """Read + concatenate multiple uploaded .txt files in week order.
+
+    Returns (combined_text, ordered_file_names). The combined text has
+    each file separated by a blank line so split_workouts() can't merge
+    a workout across the file boundary. Order is determined by the
+    minimum Week N in each file, so 'Weeks 1-10.txt' is processed
+    before 'Weeks 11-17.txt' even if dropped in the opposite order.
+    """
+    decoded = []
+    for uf in uploaded_files:
+        text = uf.read().decode("utf-8")
+        decoded.append((uf.name, text, min_week_in_text(text)))
+    decoded.sort(key=lambda t: (t[2], t[0]))
+    combined = "\n\n".join(text for _, text, _ in decoded)
+    ordered_names = [name for name, _, _ in decoded]
+    return combined, ordered_names
+
+
 def workouts_to_csv(workouts: List[dict]) -> str:
     """Render the full workout list as a CSV string for download."""
     buf = io.StringIO()
@@ -154,7 +190,16 @@ st.caption(
 # Sidebar: input + week filter.
 with st.sidebar:
     st.header("Input")
-    uploaded = st.file_uploader("Upload .txt file", type=["txt"])
+    uploaded = st.file_uploader(
+        "Upload .txt file(s)",
+        type=["txt"],
+        accept_multiple_files=True,
+        help=(
+            "Drop one file or several at once (e.g. 'Weeks 1-10.txt' and "
+            "'Weeks 11-17.txt'). Files are combined by the lowest Week N "
+            "they contain, so upload order doesn't matter."
+        ),
+    )
     st.markdown("— or —")
     pasted = st.text_area(
         "Paste workout text",
@@ -176,19 +221,30 @@ with st.sidebar:
         "- Unknown / multi-coach → All"
     )
 
-# Read input.
+# Read input. Multi-file uploads are concatenated in chronological order
+# (by the lowest Week N they contain). Pasted text is treated as a single
+# block and wins only when no files are uploaded.
 text = None
-if uploaded is not None:
-    text = uploaded.read().decode("utf-8")
+combined_filenames: List[str] = []
+if uploaded:
+    text, combined_filenames = combine_uploaded_files(uploaded)
 elif pasted.strip():
     text = pasted
 
 if not text:
     st.info(
-        "Upload a `.txt` file or paste workout text in the left sidebar "
-        "to get started."
+        "Upload one or more `.txt` files (or paste workout text) in the "
+        "left sidebar to get started."
     )
     st.stop()
+
+if len(combined_filenames) > 1:
+    st.caption(
+        "Combined "
+        + str(len(combined_filenames))
+        + " files in week order: "
+        + ", ".join(f"`{n}`" for n in combined_filenames)
+    )
 
 
 # ---------------------------------------------------------------------------
