@@ -26,6 +26,7 @@ Usage:
 import argparse
 import re
 import sys
+from hashlib import md5
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -787,7 +788,8 @@ def print_grand_total(totals: Dict[str, int], workouts_parsed: int) -> None:
 # ---------------------------------------------------------------------------
 
 def compute_workout_totals(text: str,
-                           week_filter: Optional[int] = None) -> Dict:
+                           week_filter: Optional[int] = None,
+                           dedupe: bool = True) -> Dict:
     """Parse workout text and return structured results.
 
     This is the shared entry point used by both the CLI (main()) and the
@@ -796,7 +798,11 @@ def compute_workout_totals(text: str,
       2. Build a season-wide athlete → group roster from the doc.
       3. For each workout: parse, apply checkpoint MAX fallback, attribute
          to a group via Coach line / Athletes line / header label.
-      4. Tally per-week subtotals and a grand total.
+      4. (optional) Dedupe sub-sessions whose normalized body has been
+         seen earlier in the same run — catches paste artifacts in the
+         source Doc where a coach pasted the same workout block into
+         two different weeks (e.g. Week 14 Saturday = Week 15 Saturday).
+      5. Tally per-week subtotals and a grand total.
 
     Returns a dict shaped:
         {
@@ -808,10 +814,17 @@ def compute_workout_totals(text: str,
             "weekly_subtotals": {week_num: totals_dict},
             "grand_total": totals_dict,
             "workouts_parsed": int,
+            "deduped": [
+                {"week": int, "header": str, "yards": int},
+                ...   # workouts skipped as duplicates of an earlier one
+            ],
         }
 
-    'week_filter' (1..10) optionally restricts to a single week. Workouts
+    'week_filter' (1..N) optionally restricts to a single week. Workouts
     producing zero yardage are excluded from the returned list.
+
+    'dedupe=True' (default) drops sub-sessions whose normalized body has
+    already been parsed. Set to False to keep raw output for auditing.
     """
     lines = text.splitlines()
     workouts = split_workouts(lines)
@@ -820,6 +833,8 @@ def compute_workout_totals(text: str,
     weekly_by_num: Dict[int, Dict[str, int]] = {}
     grand = empty_totals()
     workout_records: List[Dict] = []
+    deduped: List[Dict] = []
+    seen_body_hashes: set = set()
     parsed = 0
 
     for week_num, header, body in workouts:
@@ -836,8 +851,28 @@ def compute_workout_totals(text: str,
         if cp_max > manual_total:
             _assign_gap(manual, unit, cp_max - manual_total, default_group)
             method = "checkpoint"
-        if _yard_total(manual) == 0 and _meter_total(manual) == 0:
+        y_total = _yard_total(manual)
+        m_total = _meter_total(manual)
+        if y_total == 0 and m_total == 0:
             continue
+
+        # Dedupe by normalized body hash. Two sub-sessions whose entire
+        # body text (stripped, lowercased, blank lines dropped) matches
+        # are treated as the same physical workout pasted twice in the
+        # source. The first occurrence wins; subsequent ones are recorded
+        # in `deduped` for transparency but excluded from totals.
+        if dedupe:
+            norm = '\n'.join(ln.strip().lower() for ln in body if ln.strip())
+            if len(norm) >= 100:
+                h = md5(norm.encode()).hexdigest()
+                if h in seen_body_hashes:
+                    deduped.append({
+                        "week": week_num,
+                        "header": header,
+                        "yards": y_total + m_total,
+                    })
+                    continue
+                seen_body_hashes.add(h)
 
         workout_records.append({
             "week": week_num,
@@ -856,6 +891,7 @@ def compute_workout_totals(text: str,
         "weekly_subtotals": weekly_by_num,
         "grand_total": grand,
         "workouts_parsed": parsed,
+        "deduped": deduped,
     }
 
 
@@ -909,6 +945,17 @@ def main() -> int:
         print_week_subtotal(last_week, weekly_subtotals[last_week])
 
     print_grand_total(results["grand_total"], results["workouts_parsed"])
+
+    # Report any auto-deduped sub-sessions so the user can verify nothing
+    # important was suppressed. Each entry was an exact body match of an
+    # earlier sub-session in the same run (paste artifact in the source).
+    if results.get("deduped"):
+        total_y = sum(d["yards"] for d in results["deduped"])
+        print(f"\n[Auto-dedupe] Skipped {len(results['deduped'])} duplicate "
+              f"sub-session(s) totaling {total_y:,} yd/m "
+              f"(exact body matches of earlier workouts in the doc).")
+        for d in results["deduped"]:
+            print(f"  - Week {d['week']}: {d['header'][:80]} ({d['yards']:,} yd)")
     return 0
 
 

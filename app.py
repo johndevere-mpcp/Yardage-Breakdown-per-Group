@@ -191,7 +191,10 @@ st.caption(
     "grand total."
 )
 
-# Sidebar: input + week filter.
+# Sidebar — input controls. Filter dropdown is rendered below in a
+# second sidebar block AFTER we've read the input, so it can size its
+# week range to the actual max Week N found in the uploaded files
+# (covers seasons of any length without hardcoding).
 with st.sidebar:
     st.header("Input")
     uploaded = st.file_uploader(
@@ -211,8 +214,40 @@ with st.sidebar:
         placeholder="Paste the document text here...",
     )
 
+# Read input. Multi-file uploads are concatenated in chronological order
+# (by the lowest Week N they contain). Pasted text is treated as a single
+# block and wins only when no files are uploaded.
+text = None
+combined_filenames: List[str] = []
+if uploaded:
+    text, combined_filenames = combine_uploaded_files(uploaded)
+elif pasted.strip():
+    text = pasted
+
+
+def detect_max_week(t: str) -> int:
+    """Return the largest 'Week N' header found in text, or 17 as fallback.
+
+    Used to size the week-filter dropdown so it matches the season length
+    actually present in the upload. The 17-week fallback covers a typical
+    college dual-meet season for the case where nothing's been uploaded
+    yet and we still want to show a meaningful dropdown.
+    """
+    weeks = []
+    for line in (t or "").splitlines():
+        m = WEEK_HEADER_RE.match(line)
+        if m:
+            weeks.append(int(m.group(1)))
+    return max(weeks) if weeks else 17
+
+
+max_week = detect_max_week(text)
+
+# Sidebar — filter + footer (separate from the input block above so it
+# renders AFTER input has been read and the week range is known).
+with st.sidebar:
     st.header("Filter")
-    week_options = ["All weeks"] + [f"Week {i}" for i in range(1, 11)]
+    week_options = ["All weeks"] + [f"Week {i}" for i in range(1, max_week + 1)]
     week_choice = st.selectbox("Show one week (optional)", week_options)
     week_filter = None if week_choice == "All weeks" else int(week_choice.split()[1])
 
@@ -224,16 +259,6 @@ with st.sidebar:
         "- Noah → Distance\n"
         "- Unknown / multi-coach → All"
     )
-
-# Read input. Multi-file uploads are concatenated in chronological order
-# (by the lowest Week N they contain). Pasted text is treated as a single
-# block and wins only when no files are uploaded.
-text = None
-combined_filenames: List[str] = []
-if uploaded:
-    text, combined_filenames = combine_uploaded_files(uploaded)
-elif pasted.strip():
-    text = pasted
 
 if not text:
     st.info(
@@ -251,6 +276,32 @@ if len(combined_filenames) > 1:
     )
 
 
+def _render_dedupe_note(deduped):
+    """Show an info banner if auto-dedupe skipped any sub-sessions.
+
+    Lists each skipped workout so the user can sanity-check that the
+    removals are legitimate paste artifacts and not real workouts that
+    happen to share a body with an earlier one.
+    """
+    if not deduped:
+        return
+    total = sum(d["yards"] for d in deduped)
+    with st.expander(
+        f"Auto-dedupe removed {len(deduped)} duplicate sub-session(s) "
+        f"({total:,} yd) — click to see which",
+        expanded=False,
+    ):
+        st.markdown(
+            "These had body text that exactly matched an earlier sub-session "
+            "in the document (a copy-paste artifact). The first occurrence "
+            "is kept; later identical copies are excluded from totals."
+        )
+        for d in deduped:
+            st.markdown(
+                f"- **Week {d['week']}**: {d['header'][:100]} — {d['yards']:,} yd"
+            )
+
+
 # ---------------------------------------------------------------------------
 # Parse and display.
 # ---------------------------------------------------------------------------
@@ -265,6 +316,8 @@ if not results["workouts"]:
         "####/#### cumulative checkpoints or NxDIST set lines."
     )
     st.stop()
+
+_render_dedupe_note(results.get("deduped", []))
 
 # Grand total banner.
 header_text = f"Grand Total ({results['workouts_parsed']} workout(s))"
