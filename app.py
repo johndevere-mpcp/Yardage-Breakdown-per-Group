@@ -2,8 +2,14 @@
 
 A non-technical user uploads (or pastes) the Cal Swim workout document
 and sees totals split by training group: Sprint (Dave's), Mid (Josh's),
-Distance (Noah's), and All (no group specified). The four buckets sum
-to the workout total by construction.
+Distance (Noah's). Whole-team sets (parser bucket 'all') are folded
+into EACH group total because every group swims them — so the three
+displayed columns deliberately sum to MORE than the workout total
+(they overlap on whole-team yardage).
+
+Practice-level validation flags any sub-session below MIN_PRACTICE_YD
+so the user can spot either real light days (taper/recovery) or
+potential parsing gaps.
 
 Run locally:
     pip install -r requirements.txt
@@ -36,24 +42,33 @@ from swim_parser import (
 # Constants.
 # ---------------------------------------------------------------------------
 
-GROUP_KEYS = ["sprint", "mid", "distance", "all"]
-GROUP_LABELS = {
+# Each displayed group total includes the whole-team ('all') bucket
+# because every group swims those sets. The parser still tracks 'all'
+# separately under the hood (it's needed so the four parser buckets sum
+# to the workout total exactly); we only fold it in at display time.
+DISPLAY_GROUP_KEYS = ["sprint", "mid", "distance"]
+DISPLAY_GROUP_LABELS = {
     "sprint":   "Sprint",
     "mid":      "Mid",
     "distance": "Distance",
-    "all":      "All",
 }
-GROUP_HINTS = {
-    "sprint":   "Dave's group",
-    "mid":      "Josh's group",
-    "distance": "Noah's group",
-    "all":      "No group specified",
+DISPLAY_GROUP_HINTS = {
+    "sprint":   "Dave's group (incl. whole-team sets)",
+    "mid":      "Josh's group (incl. whole-team sets)",
+    "distance": "Noah's group (incl. whole-team sets)",
 }
+
+# Practice-level sanity threshold. The team's stated minimum is 2,000 yd
+# per practice; sub-sessions below this are surfaced in the Validation
+# section so the user can confirm they're real light days vs missed
+# yardage from a parsing edge case.
+MIN_PRACTICE_YD = 2000
+
 CSV_HEADERS = [
     "Week", "Workout", "Method", "Default Group",
-    "Sprint yd", "Mid yd", "Distance yd", "All yd",
-    "Sprint m", "Mid m", "Distance m", "All m",
-    "Total yd", "Total m",
+    "Sprint yd", "Mid yd", "Distance yd",
+    "Sprint m", "Mid m", "Distance m",
+    "Total yd", "Total m", "Below 2000 yd?",
 ]
 
 
@@ -69,25 +84,55 @@ def fmt_amount(yards: int, meters: int) -> str:
     return s
 
 
+def group_displays(totals: Dict[str, int]) -> Dict[str, Dict[str, int]]:
+    """Fold whole-team 'all' bucket into each group's displayed total.
+
+    Returns {sprint: {y, m}, mid: {y, m}, distance: {y, m}} where each
+    group's yards/meters = its own bucket + the 'all' bucket. Used by
+    every display surface (banner, per-week expander, daily table,
+    workouts table, CSV, Excel) so the parser can keep tracking 'all'
+    separately while the UI shows the more meaningful "yards each
+    group actually swims".
+
+    The three displayed columns will sum to MORE than the workout
+    total by 2*all_y; that's expected — the 'all' yardage is counted
+    against every group because every group swims it.
+    """
+    return {
+        "sprint": {
+            "y": totals["sprint_y"] + totals["all_y"],
+            "m": totals["sprint_m"] + totals["all_m"],
+        },
+        "mid": {
+            "y": totals["mid_y"] + totals["all_y"],
+            "m": totals["mid_m"] + totals["all_m"],
+        },
+        "distance": {
+            "y": totals["distance_y"] + totals["all_y"],
+            "m": totals["distance_m"] + totals["all_m"],
+        },
+    }
+
+
 def render_bucket_row(totals: Dict[str, int]) -> None:
-    """Render Total + 4 group metrics as a 5-column row.
+    """Render Total + 3 group metrics as a 4-column row.
 
     Used for both the grand-total banner and each per-week expander.
+    Each group's metric includes the whole-team yardage (the parser's
+    'all' bucket), so the three group columns visibly overlap on
+    whole-team sets. Total stays as the workout total (each yard
+    counted once).
     """
     y_total = _yard_total(totals)
     m_total = _meter_total(totals)
-    cols = st.columns(5)
+    disp = group_displays(totals)
+    cols = st.columns(4)
     cols[0].metric("Total", fmt_amount(y_total, m_total))
-    for i, key in enumerate(GROUP_KEYS, start=1):
-        y = totals[f"{key}_y"]
-        m = totals[f"{key}_m"]
-        pct = (y / y_total * 100) if y_total else 0
+    for i, key in enumerate(DISPLAY_GROUP_KEYS, start=1):
         cols[i].metric(
-            GROUP_LABELS[key],
-            fmt_amount(y, m),
-            delta=f"{pct:.1f}%" if y_total else None,
-            delta_color="off",
-            help=GROUP_HINTS[key],
+            DISPLAY_GROUP_LABELS[key],
+            fmt_amount(disp[key]["y"], disp[key]["m"]),
+            help=DISPLAY_GROUP_HINTS[key],
         )
 
 
@@ -97,10 +142,13 @@ def daily_to_markdown(daily_subtotals: Dict, week_num: int) -> str:
     Per the boss's spec: mini-microcycle = day, so this table sums all
     sub-sessions (AM + PM, multiple coaches) that fall on the same
     weekday into a single row. Sorted Mon → Sun via DAY_ORDER.
+    Each group column folds in the whole-team 'all' yardage (see
+    group_displays), so the three group columns overlap on whole-team
+    sets and won't sum to the day total.
     """
     lines = [
-        "| Day | Sprint | Mid | Distance | All | Total yd | Total m |",
-        "|:---|---:|---:|---:|---:|---:|---:|",
+        "| Day | Sprint | Mid | Distance | Total yd | Total m |",
+        "|:---|---:|---:|---:|---:|---:|",
     ]
     keys = [(wn, d) for (wn, d) in daily_subtotals if wn == week_num]
     keys.sort(key=lambda k: DAY_ORDER.get(k[1], 999))
@@ -110,12 +158,25 @@ def daily_to_markdown(daily_subtotals: Dict, week_num: int) -> str:
         dm = _meter_total(dt)
         if dy == 0 and dm == 0:
             continue
+        disp = group_displays(dt)
         lines.append(
-            f"| {k[1].capitalize()} | {dt['sprint_y']:,} | {dt['mid_y']:,} "
-            f"| {dt['distance_y']:,} | {dt['all_y']:,} "
+            f"| {k[1].capitalize()} | {disp['sprint']['y']:,} "
+            f"| {disp['mid']['y']:,} | {disp['distance']['y']:,} "
             f"| **{dy:,}** | {dm:,} |"
         )
     return "\n".join(lines) if len(lines) > 2 else "_No daily data for this week._"
+
+
+def is_below_threshold(totals: Dict[str, int]) -> bool:
+    """True if the workout has non-zero yardage strictly below MIN_PRACTICE_YD.
+
+    Zero-yard sub-sessions are excluded — those are typically drylands
+    or notes, not yardage-bearing practices, so flagging them as 'below
+    minimum' would be noise. Meter-only workouts also pass through (we
+    only check the yard total).
+    """
+    y = _yard_total(totals)
+    return 0 < y < MIN_PRACTICE_YD
 
 
 def workouts_to_markdown(workouts: List[dict], header_max: int = 60) -> str:
@@ -125,12 +186,13 @@ def workouts_to_markdown(workouts: List[dict], header_max: int = 60) -> str:
     which has frequent x86_64/arm64 mismatch issues on macOS. Markdown
     tables render natively in Streamlit with no extra dependency.
     Long workout headers are truncated to header_max chars so the table
-    stays readable on narrow screens.
+    stays readable on narrow screens. A ⚠️ flag is appended to any
+    workout under MIN_PRACTICE_YD so it's spottable in-table.
     """
     lines = [
         "| Week | Workout | Default | Method "
-        "| Sprint | Mid | Distance | All | Total yd | Total m |",
-        "|---:|:---|:---:|:---:|---:|---:|---:|---:|---:|---:|",
+        "| Sprint | Mid | Distance | Total yd | Total m |",
+        "|---:|:---|:---:|:---:|---:|---:|---:|---:|---:|",
     ]
     for w in workouts:
         t = w["totals"]
@@ -139,10 +201,13 @@ def workouts_to_markdown(workouts: List[dict], header_max: int = 60) -> str:
             hdr = hdr[:header_max - 1] + "…"
         # Escape pipes so a stray '|' in a header doesn't break the table.
         hdr = hdr.replace("|", "\\|")
+        flag = " ⚠️" if is_below_threshold(t) else ""
+        disp = group_displays(t)
         lines.append(
-            f"| {w['week']} | {hdr} | {w['default_group']} | {w['method']} "
-            f"| {t['sprint_y']:,} | {t['mid_y']:,} | {t['distance_y']:,} "
-            f"| {t['all_y']:,} | {_yard_total(t):,} | {_meter_total(t):,} |"
+            f"| {w['week']} | {hdr}{flag} | {w['default_group']} | {w['method']} "
+            f"| {disp['sprint']['y']:,} | {disp['mid']['y']:,} "
+            f"| {disp['distance']['y']:,} "
+            f"| {_yard_total(t):,} | {_meter_total(t):,} |"
         )
     return "\n".join(lines)
 
@@ -187,32 +252,47 @@ def combine_uploaded_files(uploaded_files) -> tuple:
 
 
 def workouts_to_csv(workouts: List[dict]) -> str:
-    """Render the full workout list as a CSV string for download."""
+    """Render the full workout list as a CSV string for download.
+
+    Each group column folds in the whole-team 'all' bucket (see
+    group_displays); the last column flags sub-sessions below
+    MIN_PRACTICE_YD so the user can filter/sort on it in Excel.
+    """
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(CSV_HEADERS)
     for w in workouts:
         t = w["totals"]
+        disp = group_displays(t)
         writer.writerow([
             w["week"], w["header"], w["method"], w["default_group"],
-            t["sprint_y"], t["mid_y"], t["distance_y"], t["all_y"],
-            t["sprint_m"], t["mid_m"], t["distance_m"], t["all_m"],
+            disp["sprint"]["y"], disp["mid"]["y"], disp["distance"]["y"],
+            disp["sprint"]["m"], disp["mid"]["m"], disp["distance"]["m"],
             _yard_total(t), _meter_total(t),
+            "YES" if is_below_threshold(t) else "",
         ])
     return buf.getvalue()
 
 
 def build_xlsx(results: Dict) -> bytes:
-    """Render the full results as a 4-sheet Excel workbook.
+    """Render the full results as a 5-sheet Excel workbook.
 
-    Mirrors the website's hierarchy:
-      Sheet 1 'Summary'    - Grand total + per-group percentages
-      Sheet 2 'Per Week'   - One row per week (all 18 in the season)
-      Sheet 3 'Per Day'    - One row per (week, day) — the mini-microcycle view
-      Sheet 4 'Workouts'   - One row per sub-session (most granular)
+    Mirrors the website's hierarchy plus a dedicated validation tab:
+      Sheet 1 'Summary'      - Grand total + per-group yards
+      Sheet 2 'Per Week'     - One row per week
+      Sheet 3 'Per Day'      - One row per (week, day) = mini-microcycle
+      Sheet 4 'Workouts'     - One row per sub-session + Below 2000 flag
+      Sheet 5 'Validation'   - One row per sub-session below MIN_PRACTICE_YD
 
-    Each downstream sheet drills into the level above. Header row is
-    bold; total/section rows are bold. Column widths auto-fit on content.
+    Group columns on every sheet fold in the whole-team 'all' yardage
+    (Sprint = sprint_y + all_y, etc.), so the three group columns
+    overlap on whole-team sets and don't sum to the workout total.
+    A note on the Summary sheet calls this out so the spreadsheet
+    can be read standalone.
+
+    Header rows are bold with a grey fill; flagged rows on the
+    Workouts sheet use a pale red fill so the boss can spot them
+    visually without filtering.
     """
     from io import BytesIO
     from openpyxl import Workbook
@@ -221,6 +301,7 @@ def build_xlsx(results: Dict) -> bytes:
     wb = Workbook()
     bold = Font(bold=True)
     header_fill = PatternFill("solid", fgColor="DDDDDD")
+    flag_fill = PatternFill("solid", fgColor="FFE0E0")
 
     def write_header(ws, headers):
         ws.append(headers)
@@ -241,19 +322,26 @@ def build_xlsx(results: Dict) -> bytes:
     gt = results["grand_total"]
     y_total = _yard_total(gt)
     m_total = _meter_total(gt)
+    disp = group_displays(gt)
 
-    write_header(ws, ["Group", "Yards", "Meters", "% of Total"])
+    write_header(ws, ["Group", "Yards", "Meters", "% of Workout Total"])
     for key, label in [("sprint", "Sprint (Dave)"),
                        ("mid", "Mid (Josh)"),
-                       ("distance", "Distance (Noah)"),
-                       ("all", "All (whole-team)")]:
-        y = gt[f"{key}_y"]
-        m = gt[f"{key}_m"]
+                       ("distance", "Distance (Noah)")]:
+        y = disp[key]["y"]
+        m = disp[key]["m"]
         pct = (y / y_total * 100) if y_total else 0
         ws.append([label, y, m, f"{pct:.1f}%"])
-    ws.append(["TOTAL", y_total, m_total, "100.0%"])
+    ws.append(["WORKOUT TOTAL (each yd counted once)", y_total, m_total, "100.0%"])
     for cell in ws[ws.max_row]:
         cell.font = bold
+    ws.append([])
+    ws.append([
+        "Note: each group's yardage includes whole-team sets that all "
+        "groups swim, so the three group rows sum to more than the "
+        "workout total. The WORKOUT TOTAL row is the season's true "
+        "unique yardage (each yard counted exactly once)."
+    ])
     ws.append([])
     ws.append([f"Sub-sessions parsed: {results['workouts_parsed']}"])
     if results.get("deduped"):
@@ -261,34 +349,43 @@ def build_xlsx(results: Dict) -> bytes:
             f"Duplicates auto-removed: {len(results['deduped'])} "
             f"({sum(d['yards'] for d in results['deduped']):,} yd)"
         ])
+    flagged_count = sum(
+        1 for w in results["workouts"] if is_below_threshold(w["totals"])
+    )
+    ws.append([
+        f"Sub-sessions below {MIN_PRACTICE_YD:,} yd: {flagged_count} "
+        "(see Validation sheet)"
+    ])
     autosize(ws)
 
     # ---- Sheet 2: Per Week ----
     ws = wb.create_sheet("Per Week")
-    write_header(ws, ["Week", "Sprint", "Mid", "Distance", "All",
-                      "Total yd", "Total m"])
+    write_header(ws, ["Week", "Sprint", "Mid", "Distance",
+                      "Workout Total yd", "Workout Total m"])
     for wn in sorted(results["weekly_subtotals"]):
         wt = results["weekly_subtotals"][wn]
+        d = group_displays(wt)
         ws.append([
             f"Week {wn}",
-            wt["sprint_y"], wt["mid_y"], wt["distance_y"], wt["all_y"],
+            d["sprint"]["y"], d["mid"]["y"], d["distance"]["y"],
             _yard_total(wt), _meter_total(wt),
         ])
     autosize(ws)
 
     # ---- Sheet 3: Per Day ----
     ws = wb.create_sheet("Per Day")
-    write_header(ws, ["Week", "Day", "Sprint", "Mid", "Distance", "All",
-                      "Total yd", "Total m"])
+    write_header(ws, ["Week", "Day", "Sprint", "Mid", "Distance",
+                      "Workout Total yd", "Workout Total m"])
     keys = sorted(
         results["daily_subtotals"].keys(),
         key=lambda k: (k[0], DAY_ORDER.get(k[1], 999)),
     )
     for (wn, day) in keys:
         dt = results["daily_subtotals"][(wn, day)]
+        d = group_displays(dt)
         ws.append([
             wn, day.capitalize(),
-            dt["sprint_y"], dt["mid_y"], dt["distance_y"], dt["all_y"],
+            d["sprint"]["y"], d["mid"]["y"], d["distance"]["y"],
             _yard_total(dt), _meter_total(dt),
         ])
     autosize(ws)
@@ -296,16 +393,43 @@ def build_xlsx(results: Dict) -> bytes:
     # ---- Sheet 4: Workouts ----
     ws = wb.create_sheet("Workouts")
     write_header(ws, ["Week", "Day", "Workout", "Default Group", "Method",
-                      "Sprint", "Mid", "Distance", "All",
-                      "Total yd", "Total m"])
+                      "Sprint", "Mid", "Distance",
+                      "Total yd", "Total m", f"Below {MIN_PRACTICE_YD} yd?"])
     for w in results["workouts"]:
         t = w["totals"]
+        d = group_displays(t)
+        below = is_below_threshold(t)
         ws.append([
             w["week"], w.get("day", "").capitalize(), w["header"],
             w["default_group"], w["method"],
-            t["sprint_y"], t["mid_y"], t["distance_y"], t["all_y"],
+            d["sprint"]["y"], d["mid"]["y"], d["distance"]["y"],
             _yard_total(t), _meter_total(t),
+            "YES" if below else "",
         ])
+        if below:
+            for cell in ws[ws.max_row]:
+                cell.fill = flag_fill
+    autosize(ws)
+
+    # ---- Sheet 5: Validation ----
+    ws = wb.create_sheet("Validation")
+    write_header(ws, ["Week", "Day", "Workout", "Default Group",
+                      "Total yd", "Total m"])
+    flagged = [w for w in results["workouts"] if is_below_threshold(w["totals"])]
+    flagged.sort(key=lambda w: (w["week"], w["header"]))
+    for w in flagged:
+        t = w["totals"]
+        ws.append([
+            w["week"], w.get("day", "").capitalize(), w["header"],
+            w["default_group"], _yard_total(t), _meter_total(t),
+        ])
+    ws.append([])
+    ws.append([
+        f"All rows above are sub-sessions with non-zero yardage below "
+        f"{MIN_PRACTICE_YD:,} yd. These are either real light days "
+        "(taper / recovery / dual-meet warmup) or a sign the parser "
+        "missed yardage from that block — worth a manual check."
+    ])
     autosize(ws)
 
     buf = BytesIO()
@@ -396,8 +520,13 @@ with st.sidebar:
         "**Coach → group mapping**\n\n"
         "- Dave → Sprint\n"
         "- Josh → Mid\n"
-        "- Noah → Distance\n"
-        "- Unknown / multi-coach → All"
+        "- Noah → Distance\n\n"
+        "Whole-team sets (no group prescribed) are folded into "
+        "every group total — every group swims them."
+    )
+    st.caption(
+        f"**Practice check:** sub-sessions below "
+        f"{MIN_PRACTICE_YD:,} yd are flagged ⚠️ in tables."
     )
 
 if not text:
@@ -439,6 +568,64 @@ def _render_dedupe_note(deduped):
         for d in deduped:
             st.markdown(
                 f"- **Week {d['week']}**: {d['header'][:100]} — {d['yards']:,} yd"
+            )
+
+
+def render_weekly_validation(results: Dict) -> None:
+    """Render a per-week sanity-check pane.
+
+    For each week:
+      • Show weekly total, sub-session count, average, and minimum.
+      • Flag the week ⚠️ if any sub-session is under MIN_PRACTICE_YD,
+        otherwise ✅.
+      • If flagged, expander lists the offending sub-sessions so the
+        user can confirm they're real light days vs missed yardage.
+
+    Zero-yard sub-sessions (drylands/notes) are excluded from min and
+    flag counts but included in the sub-session count for transparency.
+    """
+    st.subheader("Weekly Validation")
+    st.caption(
+        f"Expected minimum: **{MIN_PRACTICE_YD:,} yd per practice**. "
+        "Weeks with sub-sessions below this are flagged ⚠️ — usually "
+        "real taper / recovery / dual-meet days, but worth a glance to "
+        "rule out a parsing gap."
+    )
+
+    for week_num in sorted(results["weekly_subtotals"]):
+        wt = results["weekly_subtotals"][week_num]
+        wy = _yard_total(wt)
+        week_subs = [w for w in results["workouts"] if w["week"] == week_num]
+        nonzero_yards = [_yard_total(w["totals"]) for w in week_subs
+                         if _yard_total(w["totals"]) > 0]
+        flagged = [w for w in week_subs if is_below_threshold(w["totals"])]
+
+        n_sub = len(week_subs)
+        min_yd = min(nonzero_yards) if nonzero_yards else 0
+        avg_yd = sum(nonzero_yards) // len(nonzero_yards) if nonzero_yards else 0
+
+        if flagged:
+            label = (
+                f"⚠️ Week {week_num} — {wy:,} yd — "
+                f"{n_sub} sub-session(s), {len(flagged)} below "
+                f"{MIN_PRACTICE_YD:,} yd  (min {min_yd:,}, avg {avg_yd:,})"
+            )
+            with st.expander(label, expanded=False):
+                st.markdown(
+                    f"**{len(flagged)} sub-session(s) below "
+                    f"{MIN_PRACTICE_YD:,} yd:**"
+                )
+                for w in flagged:
+                    yd = _yard_total(w["totals"])
+                    st.markdown(
+                        f"- _{w['header']}_  — **{yd:,} yd**  "
+                        f"(default: {w['default_group']}, method: {w['method']})"
+                    )
+        else:
+            st.markdown(
+                f"✅ **Week {week_num}** — {wy:,} yd — "
+                f"{n_sub} sub-session(s), all ≥ {MIN_PRACTICE_YD:,} yd  "
+                f"(min {min_yd:,}, avg {avg_yd:,})"
             )
 
 
@@ -486,25 +673,32 @@ for week_num in sorted(results["weekly_subtotals"]):
 
 st.divider()
 
+# Per-week validation pane (per-practice minimum sanity check).
+render_weekly_validation(results)
+
+st.divider()
+
 # All workouts table.
 st.subheader("All Workouts")
 st.markdown(workouts_to_markdown(results["workouts"]))
 
 # Export — both flat CSV (one row per workout) and structured Excel
-# (4 sheets matching the website hierarchy: Summary / Per Week / Per
-# Day / Workouts). The Excel mirrors how the page is laid out so the
-# boss can drill from the headline down to a single sub-session.
+# (5 sheets: Summary / Per Week / Per Day / Workouts / Validation).
+# The Excel mirrors how the page is laid out so the boss can drill
+# from the headline down to a single sub-session and the Validation
+# sheet lists every flagged practice in one place.
 st.subheader("Export")
 col_xlsx, col_csv = st.columns(2)
 with col_xlsx:
     st.download_button(
-        label="Download Excel (4 sheets, week-by-week)",
+        label="Download Excel (5 sheets, week-by-week)",
         data=build_xlsx(results),
         file_name="swim_workouts.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         help=(
-            "Multi-sheet workbook: Summary, Per Week, Per Day, and "
-            "Workouts. Matches the page layout — Summary at top, then "
+            "Multi-sheet workbook: Summary, Per Week, Per Day, "
+            "Workouts, and Validation. Matches the page layout — "
+            "Summary at top, then "
             "drill down by week / day / individual workout."
         ),
     )
