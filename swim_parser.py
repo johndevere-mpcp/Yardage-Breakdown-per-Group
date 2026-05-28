@@ -93,19 +93,40 @@ METER_CHECKPOINT_CAP_RE = re.compile(
     r"\[\s*\d[\d,]*\s*m\s*(?:/\s*(\d[\d,]*)\s*m\s*)?\]",
     re.IGNORECASE,
 )
+# Yard bracket checkpoint — Coach Josh's convention. Matches both the
+# pair form '[1,500yds / 2,600yds]' (capture the cumulative right side)
+# and the solo form '[1,100yds]' (the bracket itself is the cumulative).
+# Pre-fix, these blocks fell through to manual NxDIST sum which missed
+# significant yardage on non-standard set notation; the bracket is the
+# coach's own running total and should be trusted.
+YARD_BRACKET_CHECKPOINT_RE = re.compile(
+    r"\[\s*(\d[\d,]*)\s*yds?\s*(?:/\s*(\d[\d,]*)\s*yds?\s*)?\]",
+    re.IGNORECASE,
+)
 # Trailing ' - NNNN' running total at the end of a line (Rule 7).
 TAIL_TOTAL_CAP_RE = re.compile(r"\s+-\s+(\d{2,5})\s*$")
+# A line that is ONLY a number (with optional whitespace). The doc uses
+# these as informal cumulative markers after a set block — e.g. '1200'
+# alone on its own line after a Low Main Work block. Threshold of 500
+# avoids treating small set distances ('300' as a 300-yd warm-down) as
+# cumulatives; the max() logic in extract_checkpoint_max means a false
+# positive here can only INCREASE the total, never decrease it below
+# manual, but high-confidence cumulative markers are typically >= 500.
+BARE_CUMULATIVE_RE = re.compile(r"^\s*(\d{3,5})\s*$")
+BARE_CUMULATIVE_MIN = 500
 
-# Rule 1: a standalone checkpoint line. Matches both yard format ("600/600")
-# AND meter bracket format ("[1,500m]" or "[2,100m / 3,600m]"). Treating
-# meter brackets as checkpoints is critical: they mark section boundaries
-# in meter workouts the same way ####/#### does in yard workouts, so a
-# multiplier block must end at them.
+# Rule 1: a standalone checkpoint line. Matches yard format ("600/600"),
+# meter bracket format ("[1,500m]" / "[2,100m / 3,600m]"), AND the yard
+# bracket form ("[1,100yds]" / "[1,500yds / 2,600yds]"). Treating these
+# as checkpoints is critical for block-termination: a multiplier block
+# must end at one so the parser doesn't merge it into adjacent sets.
 CHECKPOINT_RE = re.compile(
     r"^\s*(?:"
     r"\d{1,5}\s*/\s*\d{1,5}"
     r"|\[\s*\d[\d,]*\s*m\s*(?:/\s*\d[\d,]*\s*m\s*)?\]"
-    r")\s*$"
+    r"|\[\s*\d[\d,]*\s*yds?\s*(?:/\s*\d[\d,]*\s*yds?\s*)?\]"
+    r")\s*$",
+    re.IGNORECASE,
 )
 
 # Rule 1: a labeled sub-item line starting with "(N)" — child of a parent set.
@@ -124,7 +145,36 @@ ROUNDS_OF_RE = re.compile(r"(?i)(\d+)\s+rounds?\s+of\b")
 # pick up multiple sets on one line ("1x400 + 1x200").
 INLINE_SET_RE = re.compile(r"(\d+)\s*[xX]\s*(\d+)")
 
-# Rule 6: a plain distance line — a number followed by a stroke / drill / pace word.
+# Rule 6: a plain distance line. Pre-fix this required the stroke word to
+# appear IMMEDIATELY after the distance ('100 kick'), which missed common
+# modifier-between-them patterns like '100 steady kick', '200 FAST kick',
+# '100 social kick', and '100 - no paddles - mostly underwater kick'.
+#
+# New scheme: two stages.
+#   1. PLAIN_DIST_LEAD_RE matches a leading 2-4 digit distance.
+#   2. STROKE_OR_MODIFIER_RE checks the line contains at least one
+#      stroke / modifier word ANYWHERE — this allows arbitrary
+#      descriptor text between the distance and the stroke without
+#      hand-listing every adjective coaches use.
+#   3. DURATION_DISQUALIFIER_RE rejects time-budget lines like
+#      '90 minutes in the water' so the leading number isn't treated
+#      as yardage.
+PLAIN_DIST_LEAD_RE = re.compile(r"(?i)^\s*(\d{2,4})\b")
+STROKE_OR_MODIFIER_RE = re.compile(
+    r"(?i)\b(?:"
+    r"kick|swim|easy|free|fly|back|breast|stroke|pull|drill|im|build|"
+    r"choice|smooth|sprint|recovery|cool|flop|soc|warmup|warm|"
+    r"social|steady|fast|tempo|moderate|negative|underwater|"
+    r"descend|descending|paddles?|fins?|scull|sculling|aerobic|threshold|"
+    r"flutter|dolphin|breast(?:stroke)?|backstroke|butterfly|freestyle"
+    r")\b"
+)
+DURATION_DISQUALIFIER_RE = re.compile(
+    r"(?i)\b(?:minutes?|hours?|sec(?:onds?)?\b|min(?:s)?\b)"
+)
+# Kept as a legacy export — some downstream callers might still
+# reference this. It now only handles the strict 'dist + immediate
+# stroke' form; broader matching is done in parse_line_distance.
 PLAIN_DIST_RE = re.compile(
     r"(?i)^\s*(\d{2,4})\s+("
     r"kick|swim|easy|free|fly|back|breast|stroke|pull|drill|im|build|"
@@ -262,9 +312,15 @@ def is_meter_workout(body: str) -> bool:
 def extract_checkpoint_max(body: str) -> int:
     """Return the largest cumulative checkpoint value found in body.
 
-    Treats yard-format checkpoints, meter-bracket checkpoints, and trailing
-    " - NNNN" totals as the same kind of signal: the doc's own running
-    total. The unit (yards vs meters) is decided once by the caller via
+    Treats all five forms of cumulative marker the doc uses as the same
+    kind of signal — the coach's own running total:
+      - 1500/3000              (plain slash, most common)
+      - [1,500m / 2,600m]      (meter bracket — pair or solo)
+      - [1,500yds / 2,600yds]  (yard bracket — Coach Josh's notation)
+      - " - 3200" at line end  (tail-dash running total)
+      - 1200                   (bare number on its own line, >= 500)
+
+    The unit (yards vs meters) is decided once by the caller via
     is_meter_workout(), so this function just returns a magnitude.
     """
     max_v = 0
@@ -285,6 +341,23 @@ def extract_checkpoint_max(body: str) -> int:
                 inner = re.search(r"\d[\d,]*", m.group(0))
                 v = int(inner.group(0).replace(",", "")) if inner else 0
             if 25 <= v <= 60_000:
+                max_v = max(max_v, v)
+        # Yard bracket: prefer the captured right-hand cumulative if the
+        # form is paired '[X / Y]'; fall back to the only number for the
+        # solo form '[X]'.
+        for m in YARD_BRACKET_CHECKPOINT_RE.finditer(line):
+            cum = m.group(2) or m.group(1)
+            v = int(cum.replace(",", ""))
+            if 25 <= v <= 60_000:
+                max_v = max(max_v, v)
+        # Bare cumulative — a number on its own line. Threshold avoids
+        # treating small standalone numbers (which could be a leftover
+        # set distance) as cumulatives; the doc's actual cumulative
+        # markers in this form are all >= 500.
+        m = BARE_CUMULATIVE_RE.match(line)
+        if m:
+            v = int(m.group(1))
+            if BARE_CUMULATIVE_MIN <= v <= 60_000:
                 max_v = max(max_v, v)
     return max_v
 
@@ -529,6 +602,14 @@ def parse_line_distance(line: str, group: str, unit: str = "y") -> Dict[str, int
     unit is 'y' (yards) or 'm' (meters). The caller decides both: 'group'
     from the surrounding section context (coach-default with section-
     header overrides) and 'unit' once per workout from is_meter_workout().
+
+    Plain distance lines accept ANY descriptor between the leading
+    distance and a stroke/modifier word — coaches frequently write
+    '100 steady kick on 2:00' or '100 - no paddles - mostly underwater
+    kick' which a strict 'dist + stroke' match would miss. Duration
+    lines like '90 minutes in the water' are rejected by the
+    DURATION_DISQUALIFIER_RE so the leading number isn't double-
+    counted as yardage.
     """
     totals = empty_totals()
     bucket = f"{group}_{unit}"
@@ -541,10 +622,14 @@ def parse_line_distance(line: str, group: str, unit: str = "y") -> Dict[str, int
                 continue
             totals[bucket] += reps * dist
         return totals
-    plain = PLAIN_DIST_RE.match(line)
-    if plain:
-        dist = int(plain.group(1))
-        if dist >= 25:
+    # Plain distance: leading 2-4 digit number, with a stroke/modifier
+    # word somewhere on the line and no duration disqualifier.
+    m = PLAIN_DIST_LEAD_RE.match(line)
+    if m:
+        dist = int(m.group(1))
+        if (25 <= dist <= 5000
+                and STROKE_OR_MODIFIER_RE.search(line)
+                and not DURATION_DISQUALIFIER_RE.search(line)):
             totals[bucket] += dist
     return totals
 
