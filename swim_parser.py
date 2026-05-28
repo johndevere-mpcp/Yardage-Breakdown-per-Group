@@ -642,8 +642,12 @@ def find_block_end(lines: List[str], start: int, hard_end: int) -> int:
     """Return the index where a multiplier/rounds-of block ends.
 
     A block ends at the first of: (a) a blank line, (b) a checkpoint line
-    (####/####), (c) a header line. The returned index is one past the
-    terminator so the caller can resume from it.
+    (####/####, meter/yard bracket forms), (c) a header line, OR (d) an
+    underscore section divider — Coach Josh uses long underscore runs
+    inside his block as section dividers, and a '2x' multiplier mustn't
+    span past one (would multiply unrelated sets in the next section).
+    The returned index is one past the terminator so the caller resumes
+    from it.
     """
     i = start
     while i < hard_end:
@@ -651,6 +655,8 @@ def find_block_end(lines: List[str], start: int, hard_end: int) -> int:
         if not line.strip():
             return i + 1
         if CHECKPOINT_RE.match(line):
+            return i + 1
+        if UNDERSCORE_SPLIT_RE.match(line):
             return i + 1
         if is_header_line(line):
             return i
@@ -753,14 +759,28 @@ def parse_block(lines: List[str], unit: str = "y",
 def split_workouts(lines: List[str]) -> List[Tuple[int, str, List[str]]]:
     """Split file lines into (week_num, header, body_lines) tuples.
 
-    A new workout begins at:
+    A new sub-session begins at:
       - a "Week N" header line (resets the week number),
       - a date header line (anchored weekday + year OR weekday + "(week N)"),
-      - a Coach: line under an existing date header (parallel sub-workout),
-      - an underscore separator under an existing date header.
+      - a "Day TIME" header line (e.g. "Monday PM", "WED AM 16"),
+      - a Coach: line under an existing date header (parallel sub-workout).
+
+    Underscore separators (16+ underscores) are NOT a split point. The doc
+    uses them ambiguously — sometimes as a sub-session boundary (right
+    before a Coach: line) and sometimes as an INTERNAL section divider
+    inside one coach's prescription (e.g. Coach Josh's 80-char underscores
+    that separate Warm-up / Towers / Last Sequence inside his single
+    block). Doc-wide scan: 416 underscores total, 227 followed by a Coach:
+    line and 189 followed by content/headers. When the next line IS a
+    Coach:/date/day, that line triggers its own split, so the underscore
+    branch was redundant; when the next line is content, the underscore
+    branch wrongly shredded one coach's block into multiple 'next block'
+    sub-sessions (a 1,600-yd Coach Josh prescription showing up as
+    900 + 400 + 300 'below 2000' flags). Underscore lines now pass into
+    the body and are inert (parse_line_distance returns 0 for them).
 
     The current week number is carried with each workout so the reporter
-    can group by chronological Week 1..10.
+    can group by chronological Week 1..N.
     """
     workouts: List[Tuple[int, str, List[str]]] = []
     current_label: str = ""
@@ -807,14 +827,6 @@ def split_workouts(lines: List[str]) -> List[Tuple[int, str, List[str]]]:
             flush()
             current_label = f"{current_date}  —  {line.strip()}"
             current_body = [line]
-            body_has_workout_content = False
-            continue
-        if (UNDERSCORE_SPLIT_RE.match(line)
-                and body_has_workout_content
-                and current_date):
-            flush()
-            current_label = f"{current_date}  —  (next block)"
-            current_body = []
             body_has_workout_content = False
             continue
         current_body.append(line)
@@ -1001,15 +1013,25 @@ def compute_workout_totals(text: str,
         if y_total == 0 and m_total == 0:
             continue
 
-        # Dedupe by normalized body hash. Two sub-sessions whose entire
-        # body text (stripped, lowercased, blank lines dropped) matches
-        # are treated as the same physical workout pasted twice in the
-        # source. The first occurrence wins; subsequent ones are recorded
-        # in `deduped` for transparency but excluded from totals.
+        # Dedupe by normalized (header + body) hash. Two sub-sessions
+        # whose entire normalized text matches are treated as a paste
+        # artifact (same workout copy-pasted twice in the doc) and the
+        # later one is dropped. The first occurrence wins; later
+        # identical copies are recorded in `deduped` for transparency
+        # but excluded from totals.
+        #
+        # Header is included in the hash so legitimate template reuse
+        # across days (a coach reusing the same prescription on a
+        # different day, where the headers differ by date) doesn't
+        # collapse two real practices into one. Without the header
+        # in the hash, removing underscore-based sub-session splits
+        # caused 11k+ yd of false-positive dedupes when merged bodies
+        # happened to match earlier merged bodies on a different day.
         if dedupe:
-            norm = '\n'.join(ln.strip().lower() for ln in body if ln.strip())
-            if len(norm) >= 100:
-                h = md5(norm.encode()).hexdigest()
+            norm_header = header.strip().lower()
+            norm_body = '\n'.join(ln.strip().lower() for ln in body if ln.strip())
+            if len(norm_body) >= 100:
+                h = md5((norm_header + "\n" + norm_body).encode()).hexdigest()
                 if h in seen_body_hashes:
                     deduped.append({
                         "week": week_num,
